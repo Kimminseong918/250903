@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-# ----- (선택) matplotlib/seaborn이 없을 때도 앱이 죽지 않도록 가드 -----
+# ---- (선택) matplotlib/seaborn이 없을 때도 앱이 죽지 않도록 가드 ----
 try:
     import matplotlib
     matplotlib.use("Agg")
@@ -20,7 +20,7 @@ except Exception:
     plt = None
     sns = None
     HAS_MPL = False
-# ---------------------------------------------------------------------
+# -------------------------------------------------------------------
 
 # =========================
 # 0) 기본 설정
@@ -278,18 +278,25 @@ with tabR:
         st.dataframe(dev_tbl)
         st.bar_chart(dev_tbl.set_index("first_device")["revisit_30d"])
 
-    # 채널 × PV구간 전환율 히트맵
+    # -------- 채널 × PV구간 전환율 (수정된 안전 집계)
     pv_bins = [0, 1, 3, 5, 10, 20, 50, 100, np.inf]
     pv_cut = pd.cut(sf["pv"], bins=pv_bins, right=False)
     sf["pv_bin"] = pv_cut
-    conv_flag = sf["is_transaction"].astype(int) if "is_transaction" in sf.columns else (sf["revenue"] > 0).astype(int)
+
     conv_tbl = (
         sf.groupby(["channel", "pv_bin"], observed=False)
-        .agg(sessions=("session_id", "count"), conversions=(conv_flag.name if hasattr(conv_flag, "name") else "_", "sum"))
+        .agg(
+            sessions=("session_id", "count"),
+            conversions=("is_transaction", "sum")
+            if "is_transaction" in sf.columns
+            else ("revenue", lambda x: (x > 0).sum()),
+        )
         .reset_index()
     )
-    conv_tbl["conversions"] = sf.groupby(["channel", "pv_bin"], observed=False)[conv_flag].sum().values
-    conv_tbl["conv_rate"] = np.where(conv_tbl["sessions"] > 0, conv_tbl["conversions"] / conv_tbl["sessions"], np.nan)
+
+    conv_tbl["conv_rate"] = np.where(
+        conv_tbl["sessions"] > 0, conv_tbl["conversions"] / conv_tbl["sessions"], np.nan
+    )
     conv_tbl["pv_bin"] = conv_tbl["pv_bin"].astype(str)
 
     heat = (
@@ -299,7 +306,12 @@ with tabR:
             x=alt.X("pv_bin:N", title="PV 구간"),
             y=alt.Y("channel:N", title="채널"),
             color=alt.Color("conv_rate:Q", title="전환율"),
-            tooltip=["channel", "pv_bin", alt.Tooltip("sessions:Q", format=",.0f"), alt.Tooltip("conv_rate:Q", format=".2%")],
+            tooltip=[
+                "channel",
+                "pv_bin",
+                alt.Tooltip("sessions:Q", format=",.0f"),
+                alt.Tooltip("conv_rate:Q", format=".2%"),
+            ],
         )
         .properties(height=320)
     )
@@ -413,7 +425,7 @@ with tabRef:
         show_cols = ["source", "sessions", "avg_pv", "avg_hits", "bounce_rate"]
         st.dataframe(by_source[show_cols].rename(columns={"avg_pv": "avg_pageviews", "bounce_rate": "bounce_rate(0-1)"}))
 
-# -------- Revenue (간단한 Altair/옵션 Matplotlib)
+# -------- Revenue
 with tabRev:
     st.subheader("🌍 Distribution of Continent")
     df_f = df[df["session_id"].isin(sf["session_id"])].copy()
@@ -433,11 +445,12 @@ with tabRev:
     obs_tbl = pd.DataFrame(
         {"type": ["Observed Mobile", "Observed Desktop"], "share": [obs_mobile / total, obs_desktop / total]}
     )
-
-    chart = alt.Chart(obs_tbl).mark_bar().encode(x=alt.X("type:N", title=None), y=alt.Y("share:Q", axis=alt.Axis(format="~%")), tooltip=["type", alt.Tooltip("share:Q", format=".1%")])
+    chart = alt.Chart(obs_tbl).mark_bar().encode(
+        x=alt.X("type:N", title=None), y=alt.Y("share:Q", axis=alt.Axis(format="~%")), tooltip=["type", alt.Tooltip("share:Q", format=".1%")]
+    )
     st.altair_chart(chart.properties(height=260), use_container_width=True)
 
-# -------- Acquisition (간단 구성, Matplotlib 설치 시 보강)
+# -------- Acquisition (간단)
 with tabAcq:
     st.subheader("채널별 세션 & 신규 비율")
     channel_summary = (
