@@ -1,26 +1,170 @@
-# app.py
 # 실행: streamlit run app.py
 
+import io
 import pandas as pd
 import numpy as np
 import streamlit as st
 import altair as alt
-import altair as alt   # ← 추가
-import altair as alt
 import matplotlib.pyplot as plt
-
-
-from datetime import date, timedelta
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, MinMaxScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+import matplotlib
+from datetime import timedelta
 
 # =========================
 # 0) 기본 설정
 # =========================
-CSV_PATH = r"C:\Users\MYeongs\PycharmProjects\Google\data_3.csv"  # 필요 시 변경
 SESSION_GAP_MIN = 30  # (데이터에 session_id가 없을 때만 사용)
 
 st.set_page_config(page_title="RARRA Dashboard", layout="wide")
 st.title("📊 RARRA Dashboard (Retention • Activation • Referral • Revenue • Acquisition)")
 st.caption("Kaggle GA Customer Revenue Dataset | 세션 단위 분석")
+
+# 윈도우/리눅스 환경별 폰트 보정
+if "Malgun Gothic" in [f.name for f in matplotlib.font_manager.fontManager.ttflist]:
+    plt.rc('font', family='Malgun Gothic')
+    plt.rc('axes', unicode_minus=False)
+
+
+# =========================
+# 1) 데이터 로딩 & 세션 테이블 구성
+# =========================
+@st.cache_data(show_spinner=True)
+def load_df_from_file(file) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(file, dtype=str, low_memory=False)
+    except Exception:
+        if hasattr(file, "getvalue"):
+            df = pd.read_csv(io.BytesIO(file.getvalue()), encoding="utf-8-sig", dtype=str, low_memory=False)
+        else:
+            df = pd.read_csv(io.BytesIO(file), encoding="utf-8-sig", dtype=str, low_memory=False)
+
+    if "event_time" not in df.columns:
+        raise ValueError("event_time 컬럼이 필요합니다.")
+    df["event_time"] = pd.to_datetime(df["event_time"], utc=True, errors="coerce")
+    df["event_time_naive"] = df["event_time"].dt.tz_convert("UTC").dt.tz_localize(None)
+
+    def to_num_frame(_df, cols):
+        for col in cols:
+            if col in _df.columns:
+                _df[col] = pd.to_numeric(_df[col], errors="coerce").fillna(0)
+        return _df
+
+    df = to_num_frame(df, [
+        "totals_pageviews", "totals_hits", "totals_bounces", "totals_newVisits",
+        "totals_transactionRevenue", "session_duration", "is_transaction", "visitNumber"
+    ])
+
+    if "fullVisitorId" in df.columns:
+        df["fullVisitorId"] = df["fullVisitorId"].astype(str)
+
+    if "session_id" not in df.columns:
+        df = df.sort_values(["fullVisitorId", "event_time_naive"]).reset_index(drop=True)
+        diff = df.groupby("fullVisitorId")["event_time_naive"].diff().dt.total_seconds()
+        df["new_session"] = (diff.isna()) | (diff > SESSION_GAP_MIN * 60)
+        df["session_num"] = df.groupby("fullVisitorId")["new_session"].cumsum().astype(int)
+        df["session_id"] = df["fullVisitorId"] + "_" + df["session_num"].astype(str)
+
+    for c in ["channelGrouping", "device_deviceCategory",
+              "trafficSource_source", "trafficSource_medium", "trafficSource_referralPath"]:
+        if c not in df.columns:
+            df[c] = "Unknown"
+
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def build_session_table(df: pd.DataFrame) -> pd.DataFrame:
+    sess = (df.groupby("session_id", as_index=False)
+              .agg(
+                  fullVisitorId=("fullVisitorId","first"),
+                  session_start=("event_time_naive","min"),
+                  session_end=("event_time_naive","max"),
+                  pv=("totals_pageviews","sum"),
+                  hits=("totals_hits","sum"),
+                  bounces=("totals_bounces","max"),
+                  newVisit=("totals_newVisits","max"),
+                  visitNumber=("visitNumber","max"),
+                  revenue=("totals_transactionRevenue","sum"),
+                  channel=("channelGrouping","first"),
+                  device=("device_deviceCategory","first"),
+                  session_duration=("session_duration","max"),
+                  source=("trafficSource_source","first"),
+                  medium=("trafficSource_medium","first"),
+                  referral_path=("trafficSource_referralPath","first"),
+              ))
+
+    for c in ["source","medium","referral_path"]:
+        sess[c] = sess[c].fillna("Unknown")
+
+    sess["session_date"] = pd.to_datetime(sess["session_start"]).dt.date
+    sess["session_hour"] = pd.to_datetime(sess["session_start"]).dt.hour
+    sess["first_week"] = pd.to_datetime(sess["session_start"]).dt.to_period("W")
+    sess["is_transaction"] = (sess["revenue"] > 0).astype(int)
+
+    def compute_revisit_count_30d(_sess: pd.DataFrame) -> pd.DataFrame:
+        s = _sess.sort_values(["fullVisitorId", "session_start"]).copy()
+        first = s.groupby("fullVisitorId")["session_start"].transform("min")
+        s["within_30d"] = (s["session_start"] > first) & (s["session_start"] <= first + pd.Timedelta(days=30))
+        s["revisit_count_30d"] = s.groupby("fullVisitorId")["within_30d"].cumsum()
+        return s[["session_id", "revisit_count_30d"]]
+
+    revisit = compute_revisit_count_30d(sess)
+    sess = sess.merge(revisit, on="session_id", how="left")
+    sess["revisit_count_30d"] = sess["revisit_count_30d"].fillna(0).astype(int)
+
+    first_idx = (sess.sort_values(["fullVisitorId","session_start"])
+                    .groupby("fullVisitorId", as_index=False).head(1))
+    first_map_channel = dict(zip(first_idx["fullVisitorId"], first_idx["channel"]))
+    first_map_device  = dict(zip(first_idx["fullVisitorId"], first_idx["device"]))
+    sess["first_channel"] = sess["fullVisitorId"].map(first_map_channel)
+    sess["first_device"]  = sess["fullVisitorId"].map(first_map_device)
+
+    for c in ["pv","hits","bounces","visitNumber","session_duration"]:
+        sess[c] = sess[c].fillna(0)
+
+    return sess
+
+
+def label_user_revisit_30d(sess: pd.DataFrame) -> pd.DataFrame:
+    s = sess.copy()
+    first = s.groupby("fullVisitorId")["session_start"].transform("min")
+    s["within_30d"] = (s["session_start"] > first) & \
+                      (s["session_start"] <= first + pd.Timedelta(days=30))
+    user_has_revisit = s.groupby("fullVisitorId")["within_30d"].any().rename("revisit_30d")
+    return user_has_revisit
+
+
+def moving_avg(series: pd.Series, k: int = 7) -> pd.Series:
+    return series.rolling(k, min_periods=1).mean()
+
+
+# =========================
+# 2) 사이드바: 업로드
+# =========================
+with st.sidebar:
+    st.header("데이터 업로드")
+    uploaded = st.file_uploader("CSV 파일을 업로드하세요", type=["csv"])
+    st.caption("UTF-8/utf-8-sig 권장. 100MB 이하 권장.")
+
+if uploaded is None:
+    st.info("왼쪽에서 CSV를 업로드하면 대시보드가 생성됩니다.")
+    st.stop()
+
+df = load_df_from_file(uploaded)
+sess = build_session_table(df)
+
+# =========================
+# 이후 부분 (필터, KPI, 탭: Retention/Activation/Referral/Revenue/Acquisition)
+# =========================
+# 👉👉 여기서는 기존에 작성하신 모든 시각화/탭 코드(tabR, tabA, tabRef, tabRev, tabAcq) 부분을 그대로 이어 붙이면 됩니다.
+# (제가 위에서 업로더 관련 부분만 바꿔드렸어요. 나머지는 그대로 사용 가능)
+
 
 # =========================
 # 1) 데이터 로딩 & 세션 테이블 구성
