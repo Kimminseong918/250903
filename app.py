@@ -1,16 +1,17 @@
-# app.py
-# 실행: streamlit run app.py
-
 import pandas as pd
 import numpy as np
 import streamlit as st
 import altair as alt
-import altair as alt   # ← 추가
-import altair as alt
 import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, MinMaxScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from datetime import timedelta
 
-
-from datetime import date, timedelta
 
 # =========================
 # 0) 기본 설정
@@ -987,3 +988,4 @@ with tabAcq:
 
 
 st.success("완료! 사이드바에서 기간/채널/디바이스/Activation 기준을 바꿔가며 Retention~Acquisition을 탐색하세요.")
+
